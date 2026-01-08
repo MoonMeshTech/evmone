@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "precompiles.hpp"
+#include "../utils/stdx/utility.hpp"
+#include "evmone_precompiles/secp256r1.hpp"
 #include "precompiles_internal.hpp"
 #include "precompiles_stubs.hpp"
 #include <evmone_precompiles/blake2b.hpp>
@@ -168,13 +170,20 @@ PrecompileAnalysis expmod_analyze(bytes_view input, evmc_revision rev) noexcept
     const auto exp_len256 = be::unsafe::load<uint256>(&input_header[32]);
     const auto mod_len256 = be::unsafe::load<uint256>(&input_header[64]);
 
-    if (base_len256 == 0 && mod_len256 == 0)
-        return {min_gas, 0};
-
+    // Check the declared input lengths against the practical (2**32)
+    // or specified (EIP-7823: 2**10) limits.
     const auto len_limit =
         rev < EVMC_OSAKA ? std::numeric_limits<uint32_t>::max() : MODEXP_LEN_LIMIT_EIP7823;
-    if (base_len256 > len_limit || exp_len256 > len_limit || mod_len256 > len_limit)
+    if (base_len256 > len_limit || mod_len256 > len_limit)
         return {GasCostMax, 0};
+
+    if (exp_len256 > len_limit)
+    {
+        // Before EIP-7823, the big exponent may be canceled with zero multiplication complexity.
+        if (rev < EVMC_OSAKA && base_len256 == 0 && mod_len256 == 0)
+            return {min_gas, 0};
+        return {GasCostMax, 0};
+    }
 
     const auto base_len = static_cast<uint32_t>(base_len256);
     const auto exp_len = static_cast<uint32_t>(exp_len256);
@@ -277,27 +286,31 @@ PrecompileAnalysis bls12_map_fp2_to_g2_analyze(bytes_view, evmc_revision) noexce
     return {BLS12_MAP_FP2_TO_G2_PRECOMPILE_GAS, BLS12_G2_POINT_SIZE};
 }
 
+PrecompileAnalysis p256verify_analyze(bytes_view, evmc_revision) noexcept
+{
+    return {6900, 32};
+}
+
 ExecutionResult ecrecover_execute(const uint8_t* input, size_t input_size, uint8_t* output,
     [[maybe_unused]] size_t output_size) noexcept
 {
     assert(output_size >= 32);
 
     uint8_t input_buffer[128]{};
-    if (input_size != 0)
-        std::memcpy(input_buffer, input, std::min(input_size, std::size(input_buffer)));
+    const std::span input_span{input_buffer};
+    std::copy_n(input, std::min(input_size, std::size(input_buffer)), input_span.begin());
 
-    ethash::hash256 h{};
-    std::memcpy(h.bytes, input_buffer, sizeof(h));
+    const auto hash = input_span.subspan<0, 32>();
+    const auto v_bytes = input_span.subspan<32, 32>();
+    const auto r_bytes = input_span.subspan<64, 32>();
+    const auto s_bytes = input_span.subspan<96, 32>();
 
-    const auto v = intx::be::unsafe::load<intx::uint256>(input_buffer + 32);
+    const auto v = intx::be::unsafe::load<intx::uint256>(v_bytes.data());
     if (v != 27 && v != 28)
         return {EVMC_SUCCESS, 0};
     const bool parity = v == 28;
 
-    const auto r = intx::be::unsafe::load<intx::uint256>(input_buffer + 64);
-    const auto s = intx::be::unsafe::load<intx::uint256>(input_buffer + 96);
-
-    const auto res = evmmax::secp256k1::ecrecover(h, r, s, parity);
+    const auto res = evmmax::secp256k1::ecrecover(hash, r_bytes, s_bytes, parity);
     if (res)
     {
         std::memset(output, 0, 12);
@@ -426,20 +439,21 @@ ExecutionResult ecadd_execute(const uint8_t* input, size_t input_size, uint8_t* 
     if (input_size != 0)
         std::memcpy(input_buffer, input, std::min(input_size, std::size(input_buffer)));
 
-    const evmmax::bn254::Point p = {intx::be::unsafe::load<intx::uint256>(input_buffer),
-        intx::be::unsafe::load<intx::uint256>(input_buffer + 32)};
-    const evmmax::bn254::Point q = {intx::be::unsafe::load<intx::uint256>(input_buffer + 64),
-        intx::be::unsafe::load<intx::uint256>(input_buffer + 96)};
+    const auto input_span = std::span{input_buffer};
 
-    if (evmmax::bn254::validate(p) && evmmax::bn254::validate(q))
-    {
-        const auto res = evmmax::bn254::add(p, q);
-        intx::be::unsafe::store(output, res.x);
-        intx::be::unsafe::store(output + 32, res.y);
-        return {EVMC_SUCCESS, 64};
-    }
-    else
+    using namespace evmmax::bn254;
+
+    const auto p = AffinePoint::from_bytes(input_span.subspan<0, 64>());
+    const auto q = AffinePoint::from_bytes(input_span.subspan<64, 64>());
+    if (!p.has_value() || !q.has_value()) [[unlikely]]
         return {EVMC_PRECOMPILE_FAILURE, 0};
+    if (!validate(*p) || !validate(*q)) [[unlikely]]
+        return {EVMC_PRECOMPILE_FAILURE, 0};
+
+    const auto res = evmmax::ecc::add_affine(*p, *q);
+    const std::span<uint8_t, 64> output_span{output, 64};
+    res.to_bytes(output_span);
+    return {EVMC_SUCCESS, output_span.size()};
 }
 
 ExecutionResult ecmul_execute(const uint8_t* input, size_t input_size, uint8_t* output,
@@ -451,19 +465,20 @@ ExecutionResult ecmul_execute(const uint8_t* input, size_t input_size, uint8_t* 
     if (input_size != 0)
         std::memcpy(input_buffer, input, std::min(input_size, std::size(input_buffer)));
 
-    const evmmax::bn254::Point p = {intx::be::unsafe::load<intx::uint256>(input_buffer),
-        intx::be::unsafe::load<intx::uint256>(input_buffer + 32)};
-    const auto c = intx::be::unsafe::load<intx::uint256>(input_buffer + 64);
+    const auto input_span = std::span{input_buffer};
 
-    if (evmmax::bn254::validate(p))
-    {
-        const auto res = evmmax::bn254::mul(p, c);
-        intx::be::unsafe::store(output, res.x);
-        intx::be::unsafe::store(output + 32, res.y);
-        return {EVMC_SUCCESS, 64};
-    }
-    else
+    using namespace evmmax::bn254;
+
+    const auto p = AffinePoint::from_bytes(input_span.subspan<0, 64>());
+    if (!p.has_value() || !validate(*p)) [[unlikely]]
         return {EVMC_PRECOMPILE_FAILURE, 0};
+
+    const auto c = intx::be::unsafe::load<uint256>(input_buffer + 64);
+
+    const auto res = evmmax::bn254::mul(*p, c);
+    const std::span<uint8_t, 64> output_span{output, 64};
+    res.to_bytes(output_span);
+    return {EVMC_SUCCESS, output_span.size()};
 }
 
 ExecutionResult ecpairing_execute(const uint8_t* input, size_t input_size, uint8_t* output,
@@ -582,13 +597,21 @@ ExecutionResult bls12_g1add_execute(const uint8_t* input, size_t input_size, uin
 ExecutionResult bls12_g1msm_execute(const uint8_t* input, size_t input_size, uint8_t* output,
     [[maybe_unused]] size_t output_size) noexcept
 {
-    if (input_size % BLS12_G1_MUL_INPUT_SIZE != 0)
-        return {EVMC_PRECOMPILE_FAILURE, 0};
-
+    // Checked in `_analyze` function which must be called before.
+    assert(input_size % BLS12_G1_MUL_INPUT_SIZE == 0);
     assert(output_size == BLS12_G1_POINT_SIZE);
 
-    if (!crypto::bls::g1_msm(output, &output[64], input, input_size))
-        return {EVMC_PRECOMPILE_FAILURE, 0};
+    if (input_size == BLS12_G1_MUL_INPUT_SIZE)
+    {
+        // Optimize single multiplication case.
+        if (!crypto::bls::g1_mul(output, &output[64], input, &input[64], &input[128]))
+            return {EVMC_PRECOMPILE_FAILURE, 0};
+    }
+    else
+    {
+        if (!crypto::bls::g1_msm(output, &output[64], input, input_size))
+            return {EVMC_PRECOMPILE_FAILURE, 0};
+    }
 
     return {EVMC_SUCCESS, BLS12_G1_POINT_SIZE};
 }
@@ -610,13 +633,21 @@ ExecutionResult bls12_g2add_execute(const uint8_t* input, size_t input_size, uin
 ExecutionResult bls12_g2msm_execute(const uint8_t* input, size_t input_size, uint8_t* output,
     [[maybe_unused]] size_t output_size) noexcept
 {
-    if (input_size % BLS12_G2_MUL_INPUT_SIZE != 0)
-        return {EVMC_PRECOMPILE_FAILURE, 0};
-
+    // Checked in `_analyze` function which must be called before.
+    assert(input_size % BLS12_G2_MUL_INPUT_SIZE == 0);
     assert(output_size == BLS12_G2_POINT_SIZE);
 
-    if (!crypto::bls::g2_msm(output, &output[128], input, input_size))
-        return {EVMC_PRECOMPILE_FAILURE, 0};
+    if (input_size == BLS12_G2_MUL_INPUT_SIZE)
+    {
+        // Optimize single multiplication case.
+        if (!crypto::bls::g2_mul(output, &output[128], input, &input[128], &input[256]))
+            return {EVMC_PRECOMPILE_FAILURE, 0};
+    }
+    else
+    {
+        if (!crypto::bls::g2_msm(output, &output[128], input, input_size))
+            return {EVMC_PRECOMPILE_FAILURE, 0};
+    }
 
     return {EVMC_SUCCESS, BLS12_G2_POINT_SIZE};
 }
@@ -624,9 +655,8 @@ ExecutionResult bls12_g2msm_execute(const uint8_t* input, size_t input_size, uin
 ExecutionResult bls12_pairing_check_execute(const uint8_t* input, size_t input_size,
     uint8_t* output, [[maybe_unused]] size_t output_size) noexcept
 {
-    if (input_size % (BLS12_G1_POINT_SIZE + BLS12_G2_POINT_SIZE) != 0)
-        return {EVMC_PRECOMPILE_FAILURE, 0};
-
+    // Checked in `_analyze` function which must be called before.
+    assert(input_size % (BLS12_G1_POINT_SIZE + BLS12_G2_POINT_SIZE) == 0);
     assert(output_size == 32);
 
     if (!crypto::bls::pairing_check(output, input, input_size))
@@ -663,63 +693,111 @@ ExecutionResult bls12_map_fp2_to_g2_execute(const uint8_t* input, size_t input_s
     return {EVMC_SUCCESS, BLS12_G2_POINT_SIZE};
 }
 
+ExecutionResult p256verify_execute(const uint8_t* input, size_t input_size, uint8_t* output,
+    [[maybe_unused]] size_t output_size) noexcept
+{
+    assert(output_size >= 32);
+
+    if (input_size != 160)
+        return {EVMC_SUCCESS, 0};
+
+    ethash::hash256 h{};
+    std::copy_n(input, sizeof(h), h.bytes);
+    const auto r = intx::be::unsafe::load<intx::uint256>(input + 32);
+    const auto s = intx::be::unsafe::load<intx::uint256>(input + 64);
+    const auto qx = intx::be::unsafe::load<intx::uint256>(input + 96);
+    const auto qy = intx::be::unsafe::load<intx::uint256>(input + 128);
+
+    if (!evmmax::secp256r1::verify(h, r, s, qx, qy))
+        return {EVMC_SUCCESS, 0};  // In case of invalid signature, return empty output.
+
+    // Return 1_u256.
+    std::fill_n(output, 31, 0);
+    output[31] = 1;
+    return {EVMC_SUCCESS, 32};
+}
+
 namespace
 {
+using PrecompileLookupIndex = uint16_t;
+
 struct PrecompileTraits
 {
+    PrecompileLookupIndex address = 0;
+    evmc_revision since = EVMC_FRONTIER;
     decltype(identity_analyze)* analyze = nullptr;
     decltype(identity_execute)* execute = nullptr;
 };
 
-inline constexpr std::array<PrecompileTraits, NumPrecompiles> traits{{
-    {},  // undefined for 0
-    {ecrecover_analyze, ecrecover_execute},
-    {sha256_analyze, sha256_execute},
-    {ripemd160_analyze, ripemd160_execute},
-    {identity_analyze, identity_execute},
-    {expmod_analyze, expmod_execute},
-    {ecadd_analyze, ecadd_execute},
-    {ecmul_analyze, ecmul_execute},
-    {ecpairing_analyze, ecpairing_execute},
-    {blake2bf_analyze, blake2bf_execute},
-    {point_evaluation_analyze, point_evaluation_execute},
-    {bls12_g1add_analyze, bls12_g1add_execute},
-    {bls12_g1msm_analyze, bls12_g1msm_execute},
-    {bls12_g2add_analyze, bls12_g2add_execute},
-    {bls12_g2msm_analyze, bls12_g2msm_execute},
-    {bls12_pairing_check_analyze, bls12_pairing_check_execute},
-    {bls12_map_fp_to_g1_analyze, bls12_map_fp_to_g1_execute},
-    {bls12_map_fp2_to_g2_analyze, bls12_map_fp2_to_g2_execute},
+inline constexpr std::array<PrecompileTraits, 18> traits{{
+    {0x0001, EVMC_FRONTIER, ecrecover_analyze, ecrecover_execute},
+    {0x0002, EVMC_FRONTIER, sha256_analyze, sha256_execute},
+    {0x0003, EVMC_FRONTIER, ripemd160_analyze, ripemd160_execute},
+    {0x0004, EVMC_FRONTIER, identity_analyze, identity_execute},
+    {0x0005, EVMC_BYZANTIUM, expmod_analyze, expmod_execute},
+    {0x0006, EVMC_BYZANTIUM, ecadd_analyze, ecadd_execute},
+    {0x0007, EVMC_BYZANTIUM, ecmul_analyze, ecmul_execute},
+    {0x0008, EVMC_BYZANTIUM, ecpairing_analyze, ecpairing_execute},
+    {0x0009, EVMC_ISTANBUL, blake2bf_analyze, blake2bf_execute},
+    {0x000a, EVMC_CANCUN, point_evaluation_analyze, point_evaluation_execute},
+    {0x000b, EVMC_PRAGUE, bls12_g1add_analyze, bls12_g1add_execute},
+    {0x000c, EVMC_PRAGUE, bls12_g1msm_analyze, bls12_g1msm_execute},
+    {0x000d, EVMC_PRAGUE, bls12_g2add_analyze, bls12_g2add_execute},
+    {0x000e, EVMC_PRAGUE, bls12_g2msm_analyze, bls12_g2msm_execute},
+    {0x000f, EVMC_PRAGUE, bls12_pairing_check_analyze, bls12_pairing_check_execute},
+    {0x0010, EVMC_PRAGUE, bls12_map_fp_to_g1_analyze, bls12_map_fp_to_g1_execute},
+    {0x0011, EVMC_PRAGUE, bls12_map_fp2_to_g2_analyze, bls12_map_fp2_to_g2_execute},
+    {0x0100, EVMC_OSAKA, p256verify_analyze, p256verify_execute},
 }};
+
+constexpr auto LOOKUP_TABLE_SIZE = [] {
+    PrecompileLookupIndex max_idx = 0;
+    for (const auto& trait : traits)
+        max_idx = std::max(max_idx, trait.address);
+    return max_idx + 1;
+}();
+
+PrecompileLookupIndex to_lookup_index(const evmc::address& addr) noexcept
+{
+    static constexpr auto ADDRESS_SIZE = sizeof(addr.bytes);
+    return static_cast<PrecompileLookupIndex>(
+        (addr.bytes[ADDRESS_SIZE - 2] << 8) | addr.bytes[ADDRESS_SIZE - 1]);
+}
 }  // namespace
 
 bool is_precompile(evmc_revision rev, const evmc::address& addr) noexcept
 {
-    if (evmc::is_zero(addr) || addr > evmc::address{stdx::to_underlying(PrecompileId::latest)})
-        return false;
+    static constexpr auto AVAILABILITY_LOOKUP_TABLE = [] {
+        using Entry = std::underlying_type_t<evmc_revision>;
+        std::array<Entry, LOOKUP_TABLE_SIZE> table{};
+        std::ranges::fill(table, std::numeric_limits<Entry>::max());
+        for (const auto& trait : traits)
+            table[trait.address] = stdx::to_underlying(trait.since);
+        return table;
+    }();
 
-    const auto id = addr.bytes[19];
-    if (rev < EVMC_BYZANTIUM && id >= stdx::to_underlying(PrecompileId::since_byzantium))
+    if (addr >= evmc::address{AVAILABILITY_LOOKUP_TABLE.size()})
         return false;
-
-    if (rev < EVMC_ISTANBUL && id >= stdx::to_underlying(PrecompileId::since_istanbul))
-        return false;
-
-    if (rev < EVMC_CANCUN && id >= stdx::to_underlying(PrecompileId::since_cancun))
-        return false;
-
-    if (rev < EVMC_PRAGUE && id >= stdx::to_underlying(PrecompileId::since_prague))
-        return false;
-
-    return true;
+    return AVAILABILITY_LOOKUP_TABLE[to_lookup_index(addr)] <= stdx::to_underlying(rev);
 }
 
 evmc::Result call_precompile(evmc_revision rev, const evmc_message& msg) noexcept
 {
+    static constexpr auto EXECUTION_LOOKUP_TABLE = [] {
+        struct Entry
+        {
+            decltype(PrecompileTraits::analyze) analyze = nullptr;
+            decltype(PrecompileTraits::execute) execute = nullptr;
+        };
+        std::array<Entry, LOOKUP_TABLE_SIZE> table{};
+        for (const auto& trait : traits)
+            table[trait.address] = {trait.analyze, trait.execute};
+        return table;
+    }();
+
     assert(msg.gas >= 0);
 
-    const auto id = msg.code_address.bytes[19];
-    const auto [analyze, execute] = traits[id];
+    const auto [analyze, execute] = EXECUTION_LOOKUP_TABLE[to_lookup_index(msg.code_address)];
 
     const bytes_view input{msg.input_data, msg.input_size};
     const auto [gas_cost, max_output_size] = analyze(input, rev);
